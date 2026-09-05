@@ -1,0 +1,362 @@
+# Source pinned to the inspected ios-host revision; V2 run 33959922283.
+# V2 left a dangling get_size() tail; this atomic unified diff replaces complete methods.
+name: Build FIFA13 IPA-Metadata Fix V3 Applesauce
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: f1d72d33fd2ef9ca4af4ee48344c5bdf717b7602
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Rust iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+          components: rustfmt
+
+      - name: Install build dependencies
+        run: |
+          brew install cmake ninja boost
+          echo "TOUCHHLE_BOOST_ROOT=$(brew --prefix boost)/include" >> "$GITHUB_ENV"
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+
+      - name: Apply verified FIFA13 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/fifa13-v3.patch" <<'FIFA13_PATCH'
+          --- a/platform/ios/rust-entry/src/lib.rs
+          +++ b/platform/ios/rust-entry/src/lib.rs
+          @@ -1,5 +1,66 @@
+           use std::ffi::{CStr, CString};
+           use std::os::raw::{c_char, c_uchar};
+          +
+          +use std::alloc::{GlobalAlloc, Layout, System};
+          +use std::backtrace::Backtrace;
+          +use std::sync::atomic::{AtomicBool, Ordering};
+          +
+          +struct FIFA13TracingAllocator;
+          +
+          +static FIFA13_ALLOC_TRACE_ACTIVE: AtomicBool = AtomicBool::new(false);
+          +
+          +fn fifa13_trace_host_alloc(kind: &str, old_size: usize, new_size: usize) {
+          +    // Avoid recursion because formatting/backtrace capture may itself allocate.
+          +    if new_size < 64 * 1024 * 1024 {
+          +        return;
+          +    }
+          +    if FIFA13_ALLOC_TRACE_ACTIVE.swap(true, Ordering::SeqCst) {
+          +        return;
+          +    }
+          +
+          +    eprintln!(
+          +        "FIFA13-HOST-ALLOC kind={} old_size={} new_size={} ({} MiB)",
+          +        kind,
+          +        old_size,
+          +        new_size,
+          +        new_size as f64 / (1024.0 * 1024.0)
+          +    );
+          +    eprintln!(
+          +        "FIFA13-HOST-ALLOC backtrace:\n{:?}",
+          +        Backtrace::force_capture()
+          +    );
+          +
+          +    FIFA13_ALLOC_TRACE_ACTIVE.store(false, Ordering::SeqCst);
+          +}
+          +
+          +unsafe impl GlobalAlloc for FIFA13TracingAllocator {
+          +    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+          +        fifa13_trace_host_alloc("alloc", 0, layout.size());
+          +        System.alloc(layout)
+          +    }
+          +
+          +    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+          +        fifa13_trace_host_alloc("alloc_zeroed", 0, layout.size());
+          +        System.alloc_zeroed(layout)
+          +    }
+          +
+          +    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+          +        System.dealloc(ptr, layout)
+          +    }
+          +
+          +    unsafe fn realloc(
+          +        &self,
+          +        ptr: *mut u8,
+          +        layout: Layout,
+          +        new_size: usize,
+          +    ) -> *mut u8 {
+          +        fifa13_trace_host_alloc("realloc", layout.size(), new_size);
+          +        System.realloc(ptr, layout, new_size)
+          +    }
+          +}
+          +
+          +#[global_allocator]
+          +static FIFA13_GLOBAL_ALLOCATOR: FIFA13TracingAllocator = FIFA13TracingAllocator;
+           
+           pub struct TouchHLEIOSGameMetadata {
+               display_name: CString,
+          @@ -15,6 +76,9 @@
+           }
+           
+           fn run_touchhle(args: Vec<String>) -> i32 {
+          +    // Force Rust backtraces inside the iOS host/core for this diagnostic build.
+          +    std::env::set_var("RUST_BACKTRACE", "full");
+          +    eprintln!("FIFA13-HOST-ALLOC diagnostic tracing enabled (threshold 64 MiB)");
+               touchHLE::clear_host_exit_request();
+           
+               // The emulator runs on the main thread and this is called from
+          --- a/src/frameworks/foundation/ns_url_connection.rs
+          +++ b/src/frameworks/foundation/ns_url_connection.rs
+          @@ -33,7 +33,8 @@
+           const NS_URL_ERROR_NOT_CONNECTED_TO_INTERNET: i32 = -1009;
+           
+           fn fake_network_success_enabled() -> bool {
+          -    std::env::var_os("TOUCHHLE_FAKE_NETWORK_SUCCESS").is_some()
+          +    // FIFA 13 compatibility experiment.
+          +    true
+           }
+           
+           // ---------------------------------------------------------------------------
+          --- a/src/fs/bundle.rs
+          +++ b/src/fs/bundle.rs
+          @@ -307,27 +307,50 @@
+                   }
+               }
+           
+          +    // ZIP headers contain both values; do not call open() or read payload data.
+          +    fn ensure_metadata(&self) {
+          +        if self.metadata_map.borrow().contains_key(&self.index) {
+          +            return;
+          +        }
+          +        let metadata = {
+          +            let mut archive = self.archive.borrow_mut();
+          +            let result = match archive.by_index_raw(self.index) {
+          +                Ok(file) => {
+          +                    let modified = file.last_modified();
+          +                    let date = tm::from(
+          +                        modified.year(), modified.month(), modified.day(),
+          +                        modified.hour(), modified.minute(), modified.second(),
+          +                    );
+          +                    Some(ArchivedFileMetadata {
+          +                        last_modified: calendar_date_to_timestamp(date).into(),
+          +                        size: file.size(),
+          +                    })
+          +                }
+          +                Err(error) => {
+          +                    log!("IPA metadata lookup failed for entry {}: {}", self.index, error);
+          +                    None
+          +                }
+          +            };
+          +            result
+          +        };
+          +        // Release the archive borrow before touching the metadata cache.
+          +        // Failed lookups are not cached, allowing a later lookup to retry.
+          +        if let Some(metadata) = metadata {
+          +            self.metadata_map.borrow_mut().entry(self.index).or_insert(metadata);
+          +        }
+          +    }
+          +
+               pub fn get_last_modified(&self) -> time_t {
+          -        if !self.metadata_map.borrow().contains_key(&self.index) {
+          -            // This will force metadata loading
+          -            // TODO: get metadata without reading the file
+          -            _ = self.open();
+          -        }
+          -        self.metadata_map
+          -            .borrow()
+          -            .get(&self.index)
+          -            .unwrap()
+          -            .last_modified
+          -            .try_into()
+          -            .unwrap()
+          -    }
+          +        self.ensure_metadata();
+          +        self.metadata_map.borrow().get(&self.index)
+          +            .map(|meta| meta.last_modified.try_into().unwrap_or_default())
+          +            .unwrap_or_default()
+          +    }
+          +
+               pub fn get_size(&self) -> u64 {
+          -        if !self.metadata_map.borrow().contains_key(&self.index) {
+          -            // This will force metadata loading
+          -            // TODO: get metadata without reading the file
+          -            _ = self.open();
+          -        }
+          -        self.metadata_map.borrow().get(&self.index).unwrap().size
+          +        self.ensure_metadata();
+          +        self.metadata_map.borrow().get(&self.index)
+          +            .map(|meta| meta.size).unwrap_or_default()
+               }
+           }
+           
+          --- a/src/libc/malloc.rs
+          +++ b/src/libc/malloc.rs
+          @@ -58,8 +58,8 @@
+                       reserved2: Ptr::null(),
+                       size: fn_ptr(env, "_malloc_zone_size"),
+                       malloc: fn_ptr(env, "_malloc_zone_malloc"),
+          -            calloc: Ptr::null(),
+          -            valloc: Ptr::null(),
+          +            calloc: fn_ptr(env, "_malloc_zone_calloc"),
+          +            valloc: fn_ptr(env, "_malloc_zone_valloc"),
+                       free: fn_ptr(env, "_malloc_zone_free"),
+                       realloc: fn_ptr(env, "_malloc_zone_realloc"),
+                       destroy: fn_ptr(env, "_malloc_destroy_zone"),
+          @@ -85,10 +85,15 @@
+           
+           fn malloc_create_zone(
+               env: &mut Environment,
+          -    _start_size: GuestUSize,
+          +    start_size: GuestUSize,
+               flags: u32,
+           ) -> MutPtr<malloc_zone_t> {
+               assert_eq!(flags, 0);
+          +    log!(
+          +        "FIFA13-DIAG malloc_create_zone(start_size={} bytes / {} KB)",
+          +        start_size,
+          +        start_size / 1024
+          +    );
+               // All zones are backed by the single global heap, so a created zone is
+               // just another `malloc_zone_t` struct.
+               let zone_data = malloc_zone_t::new(env);
+          @@ -118,7 +123,57 @@
+               _zone: MutPtr<malloc_zone_t>,
+               size: GuestUSize,
+           ) -> MutVoidPtr {
+          -    env.mem.alloc(size)
+          +    if size >= 16 * 1024 * 1024 {
+          +        log!("FIFA13-DIAG malloc_zone_malloc({} bytes)", size);
+          +    }
+          +    let ptr = env.mem.alloc(size);
+          +    if size >= 16 * 1024 * 1024 {
+          +        log!("FIFA13-DIAG malloc_zone_malloc -> {:#x}", ptr.to_bits());
+          +    }
+          +    ptr
+          +}
+          +
+          +fn malloc_zone_calloc(
+          +    env: &mut Environment,
+          +    _zone: MutPtr<malloc_zone_t>,
+          +    count: GuestUSize,
+          +    size: GuestUSize,
+          +) -> MutVoidPtr {
+          +    let Some(mut total) = count.checked_mul(size) else {
+          +        log!(
+          +            "FIFA13-DIAG malloc_zone_calloc overflow: count={} size={}",
+          +            count,
+          +            size
+          +        );
+          +        return MutVoidPtr::null();
+          +    };
+          +    if total == 0 {
+          +        total = 1;
+          +    }
+          +    if total >= 16 * 1024 * 1024 {
+          +        log!(
+          +            "FIFA13-DIAG malloc_zone_calloc(count={}, size={}, total={} bytes)",
+          +            count,
+          +            size,
+          +            total
+          +        );
+          +    }
+          +    let ptr = env.mem.calloc(total);
+          +    if total >= 16 * 1024 * 1024 {
+          +        log!("FIFA13-DIAG malloc_zone_calloc -> {:#x}", ptr.to_bits());
+          +    }
+          +    ptr
+          +}
+          +
+          +fn malloc_zone_valloc(
+          +    env: &mut Environment,
+          +    zone: MutPtr<malloc_zone_t>,
+          +    size: GuestUSize,
+          +) -> MutVoidPtr {
+          +    if size >= 16 * 1024 * 1024 {
+          +        log!("FIFA13-DIAG malloc_zone_valloc({} bytes)", size);
+          +    }
+          +    malloc_zone_memalign(env, zone, 4096, size)
+           }
+           
+           fn malloc_zone_realloc(
+          @@ -198,6 +253,8 @@
+               export_c_func!(malloc_destroy_zone(_)),
+               export_c_func!(malloc_zone_free(_, _)),
+               export_c_func!(malloc_zone_malloc(_, _)),
+          +    export_c_func!(malloc_zone_calloc(_, _, _)),
+          +    export_c_func!(malloc_zone_valloc(_, _)),
+               export_c_func!(malloc_zone_memalign(_, _, _)),
+               export_c_func!(malloc_zone_realloc(_, _, _)),
+               export_c_func!(malloc_zone_size(_, _)),
+          FIFA13_PATCH
+          git apply --check "$RUNNER_TEMP/fifa13-v3.patch"
+          git apply "$RUNNER_TEMP/fifa13-v3.patch"
+
+      - name: Validate patched Rust syntax before building
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in src/fs/bundle.rs src/libc/malloc.rs src/frameworks/foundation/ns_url_connection.rs platform/ios/rust-entry/src/lib.rs; do
+            rustfmt --edition 2021 --emit stdout "$file" > /dev/null
+          done
+
+      - name: Build shared SDL2 for iPhone
+        run: |
+          sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+
+      - name: Build unsigned iOS app
+        run: |
+          export CARGO_PROFILE_RELEASE_DEBUG=2
+          sh platform/ios/scripts/build-host.sh iphoneos Release
+
+      - name: Give test build a separate identity
+        run: |
+          APP="build/host-iphoneos/Build/Products/Release-iphoneos/Applesauce.app"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleIdentifier com.hasangs27.applesauce.fifa13ipafixv3" \
+            "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleDisplayName Applesauce FIFA13 IPAFIX3" \
+            "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleName Applesauce FIFA13 IPAFIX3" \
+            "$APP/Info.plist" || true
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p dist
+          sh platform/ios/scripts/package-ipa.sh \
+            dist/Applesauce-FIFA13-IPAMetadataFixV3-unsigned.ipa
+
+      - name: Verify IPA and checksum
+        run: |
+          test -s dist/Applesauce-FIFA13-IPAMetadataFixV3-unsigned.ipa
+          unzip -tq dist/Applesauce-FIFA13-IPAMetadataFixV3-unsigned.ipa
+          cd dist
+          shasum -a 256 -c Applesauce-FIFA13-IPAMetadataFixV3-unsigned.ipa.sha256
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Applesauce-FIFA13-IPAMetadataFixV3
+          path: |
+            dist/Applesauce-FIFA13-IPAMetadataFixV3-unsigned.ipa
+            dist/Applesauce-FIFA13-IPAMetadataFixV3-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 7
