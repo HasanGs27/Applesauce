@@ -58,6 +58,10 @@ jobs:
           print("Fake-network patch applied.")
           PY
 
+      - name: Build shared SDL2 for iPhone
+        run: |
+          sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+
       - name: Build unsigned iOS app
         run: |
           sh platform/ios/scripts/build-host.sh iphoneos Release
