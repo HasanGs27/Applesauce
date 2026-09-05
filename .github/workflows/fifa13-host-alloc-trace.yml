@@ -1,0 +1,332 @@
+name: Build FIFA13 Host-Alloc Trace Applesauce
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Rust iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install build dependencies
+        run: |
+          brew install cmake ninja boost
+          echo "TOUCHHLE_BOOST_ROOT=$(brew --prefix boost)/include" >> "$GITHUB_ENV"
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+
+      - name: Apply FIFA 13 compatibility patches
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # ------------------------------------------------------------
+          # 1) Keep the fake HTTP success experiment enabled.
+          # ------------------------------------------------------------
+          p = Path("src/frameworks/foundation/ns_url_connection.rs")
+          s = p.read_text(encoding="utf-8")
+
+          old = '''fn fake_network_success_enabled() -> bool {
+              std::env::var_os("TOUCHHLE_FAKE_NETWORK_SUCCESS").is_some()
+          }'''
+          new = '''fn fake_network_success_enabled() -> bool {
+              // FIFA 13 compatibility experiment.
+              true
+          }'''
+
+          if old not in s:
+              raise SystemExit("Network patch target not found.")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+
+          # ------------------------------------------------------------
+          # 2) Complete malloc_zone_t callbacks.
+          #
+          # FIFA 13 reaches its HttpMgr and then logs:
+          #   "Creating module with a 65536kbyte buffer"
+          #
+          # HyperHLE currently exposes NULL calloc/valloc callbacks in
+          # malloc_zone_t. An old game calling those callbacks directly can
+          # branch through address 0 and kill the guest/host process.
+          # ------------------------------------------------------------
+          p = Path("src/libc/malloc.rs")
+          s = p.read_text(encoding="utf-8")
+
+          old = '''            calloc: Ptr::null(),
+                      valloc: Ptr::null(),'''
+          new = '''            calloc: fn_ptr(env, "_malloc_zone_calloc"),
+                      valloc: fn_ptr(env, "_malloc_zone_valloc"),'''
+
+          if old not in s:
+              raise SystemExit("malloc_zone_t callback patch target not found.")
+          s = s.replace(old, new, 1)
+
+          old = '''fn malloc_create_zone(
+              env: &mut Environment,
+              _start_size: GuestUSize,
+              flags: u32,
+          ) -> MutPtr<malloc_zone_t> {
+              assert_eq!(flags, 0);
+              // All zones are backed by the single global heap, so a created zone is
+              // just another `malloc_zone_t` struct.
+              let zone_data = malloc_zone_t::new(env);
+              env.mem.alloc_and_write(zone_data)
+          }'''
+
+          new = '''fn malloc_create_zone(
+              env: &mut Environment,
+              start_size: GuestUSize,
+              flags: u32,
+          ) -> MutPtr<malloc_zone_t> {
+              assert_eq!(flags, 0);
+              log!(
+                  "FIFA13-DIAG malloc_create_zone(start_size={} bytes / {} KB)",
+                  start_size,
+                  start_size / 1024
+              );
+              // All zones are backed by the single global heap, so a created zone is
+              // just another `malloc_zone_t` struct.
+              let zone_data = malloc_zone_t::new(env);
+              env.mem.alloc_and_write(zone_data)
+          }'''
+
+          if old not in s:
+              raise SystemExit("malloc_create_zone patch target not found.")
+          s = s.replace(old, new, 1)
+
+          old = '''fn malloc_zone_malloc(
+              env: &mut Environment,
+              _zone: MutPtr<malloc_zone_t>,
+              size: GuestUSize,
+          ) -> MutVoidPtr {
+              env.mem.alloc(size)
+          }'''
+
+          new = '''fn malloc_zone_malloc(
+              env: &mut Environment,
+              _zone: MutPtr<malloc_zone_t>,
+              size: GuestUSize,
+          ) -> MutVoidPtr {
+              if size >= 16 * 1024 * 1024 {
+                  log!("FIFA13-DIAG malloc_zone_malloc({} bytes)", size);
+              }
+              let ptr = env.mem.alloc(size);
+              if size >= 16 * 1024 * 1024 {
+                  log!("FIFA13-DIAG malloc_zone_malloc -> {:#x}", ptr.to_bits());
+              }
+              ptr
+          }
+
+          fn malloc_zone_calloc(
+              env: &mut Environment,
+              _zone: MutPtr<malloc_zone_t>,
+              count: GuestUSize,
+              size: GuestUSize,
+          ) -> MutVoidPtr {
+              let Some(mut total) = count.checked_mul(size) else {
+                  log!(
+                      "FIFA13-DIAG malloc_zone_calloc overflow: count={} size={}",
+                      count,
+                      size
+                  );
+                  return MutVoidPtr::null();
+              };
+              if total == 0 {
+                  total = 1;
+              }
+              if total >= 16 * 1024 * 1024 {
+                  log!(
+                      "FIFA13-DIAG malloc_zone_calloc(count={}, size={}, total={} bytes)",
+                      count,
+                      size,
+                      total
+                  );
+              }
+              let ptr = env.mem.calloc(total);
+              if total >= 16 * 1024 * 1024 {
+                  log!("FIFA13-DIAG malloc_zone_calloc -> {:#x}", ptr.to_bits());
+              }
+              ptr
+          }
+
+          fn malloc_zone_valloc(
+              env: &mut Environment,
+              zone: MutPtr<malloc_zone_t>,
+              size: GuestUSize,
+          ) -> MutVoidPtr {
+              if size >= 16 * 1024 * 1024 {
+                  log!("FIFA13-DIAG malloc_zone_valloc({} bytes)", size);
+              }
+              malloc_zone_memalign(env, zone, 4096, size)
+          }'''
+
+          if old not in s:
+              raise SystemExit("malloc_zone_malloc patch target not found.")
+          s = s.replace(old, new, 1)
+
+          old = '''    export_c_func!(malloc_zone_free(_, _)),
+              export_c_func!(malloc_zone_malloc(_, _)),
+              export_c_func!(malloc_zone_memalign(_, _, _)),'''
+
+          new = '''    export_c_func!(malloc_zone_free(_, _)),
+              export_c_func!(malloc_zone_malloc(_, _)),
+              export_c_func!(malloc_zone_calloc(_, _, _)),
+              export_c_func!(malloc_zone_valloc(_, _)),
+              export_c_func!(malloc_zone_memalign(_, _, _)),'''
+
+          if old not in s:
+              raise SystemExit("malloc zone exports patch target not found.")
+          s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding="utf-8")
+          print("FIFA 13 network + malloc-zone patches applied.")
+          PY
+
+      - name: Add host allocation backtrace instrumentation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("platform/ios/rust-entry/src/lib.rs")
+          s = p.read_text(encoding="utf-8")
+
+          import_marker = 'use std::os::raw::{c_char, c_uchar};\n'
+          instrumentation = r'''
+          use std::alloc::{GlobalAlloc, Layout, System};
+          use std::backtrace::Backtrace;
+          use std::sync::atomic::{AtomicBool, Ordering};
+
+          struct FIFA13TracingAllocator;
+
+          static FIFA13_ALLOC_TRACE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+          fn fifa13_trace_host_alloc(kind: &str, old_size: usize, new_size: usize) {
+              // Avoid recursion because formatting/backtrace capture may itself allocate.
+              if new_size < 64 * 1024 * 1024 {
+                  return;
+              }
+              if FIFA13_ALLOC_TRACE_ACTIVE.swap(true, Ordering::SeqCst) {
+                  return;
+              }
+
+              eprintln!(
+                  "FIFA13-HOST-ALLOC kind={} old_size={} new_size={} ({} MiB)",
+                  kind,
+                  old_size,
+                  new_size,
+                  new_size as f64 / (1024.0 * 1024.0)
+              );
+              eprintln!(
+                  "FIFA13-HOST-ALLOC backtrace:\n{:?}",
+                  Backtrace::force_capture()
+              );
+
+              FIFA13_ALLOC_TRACE_ACTIVE.store(false, Ordering::SeqCst);
+          }
+
+          unsafe impl GlobalAlloc for FIFA13TracingAllocator {
+              unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                  fifa13_trace_host_alloc("alloc", 0, layout.size());
+                  System.alloc(layout)
+              }
+
+              unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                  fifa13_trace_host_alloc("alloc_zeroed", 0, layout.size());
+                  System.alloc_zeroed(layout)
+              }
+
+              unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                  System.dealloc(ptr, layout)
+              }
+
+              unsafe fn realloc(
+                  &self,
+                  ptr: *mut u8,
+                  layout: Layout,
+                  new_size: usize,
+              ) -> *mut u8 {
+                  fifa13_trace_host_alloc("realloc", layout.size(), new_size);
+                  System.realloc(ptr, layout, new_size)
+              }
+          }
+
+          #[global_allocator]
+          static FIFA13_GLOBAL_ALLOCATOR: FIFA13TracingAllocator = FIFA13TracingAllocator;
+          '''
+
+          if import_marker not in s:
+              raise SystemExit("rust-entry import marker not found.")
+          s = s.replace(import_marker, import_marker + instrumentation, 1)
+
+          old = '''fn run_touchhle(args: Vec<String>) -> i32 {
+              touchHLE::clear_host_exit_request();
+          '''
+          new = '''fn run_touchhle(args: Vec<String>) -> i32 {
+              // Force Rust backtraces inside the iOS host/core for this diagnostic build.
+              std::env::set_var("RUST_BACKTRACE", "full");
+              eprintln!("FIFA13-HOST-ALLOC diagnostic tracing enabled (threshold 64 MiB)");
+              touchHLE::clear_host_exit_request();
+          '''
+
+          if old not in s:
+              raise SystemExit("run_touchhle patch target not found.")
+          s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding="utf-8")
+          print("Host allocation tracing patch applied.")
+          PY
+
+
+      - name: Build shared SDL2 for iPhone
+        run: |
+          sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+
+      - name: Build unsigned iOS app
+        run: |
+          export CARGO_PROFILE_RELEASE_DEBUG=2
+          sh platform/ios/scripts/build-host.sh iphoneos Release
+
+      - name: Give test build a separate identity
+        run: |
+          APP="build/host-iphoneos/Build/Products/Release-iphoneos/Applesauce.app"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleIdentifier com.hasangs27.applesauce.fifa13alloctrace" \
+            "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleDisplayName Applesauce FIFA13 TRACE" \
+            "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleName Applesauce FIFA13 TRACE" \
+            "$APP/Info.plist" || true
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p dist
+          sh platform/ios/scripts/package-ipa.sh \
+            dist/Applesauce-FIFA13-HostAllocTrace-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Applesauce-FIFA13-HostAllocTrace
+          path: |
+            dist/Applesauce-FIFA13-HostAllocTrace-unsigned.ipa
+            dist/Applesauce-FIFA13-HostAllocTrace-unsigned.ipa.sha256
+          retention-days: 7
