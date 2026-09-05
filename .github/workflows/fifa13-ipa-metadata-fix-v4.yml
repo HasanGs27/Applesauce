@@ -1,0 +1,1089 @@
+# Source pinned to the inspected ios-host revision; V2 run 33959922283.
+# V2 left a dangling get_size() tail; this atomic unified diff replaces complete methods.
+name: Build FIFA13 IPA-Metadata Fix V4 Applesauce
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: f1d72d33fd2ef9ca4af4ee48344c5bdf717b7602
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Rust iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+          components: rustfmt
+
+      - name: Install build dependencies
+        run: |
+          brew install cmake ninja boost
+          echo "TOUCHHLE_BOOST_ROOT=$(brew --prefix boost)/include" >> "$GITHUB_ENV"
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+
+      - name: Apply verified FIFA13 bounded I/O patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/fifa13-v4.patch" <<'FIFA13_PATCH'
+          --- a/Cargo.toml
+          +++ b/Cargo.toml
+          @@ -52,6 +52,7 @@
+           gl_generator = "0.14.0"
+           
+           [dependencies]
+          +tempfile = "=3.23.0"
+           caf = "0.1.0" # ИСПРАВЛЕНИЕ: Добавлен недостающий крейт
+           hound = "3.5.0"
+           mach_object = "0.1.17"
+          --- a/platform/ios/rust-entry/src/lib.rs
+          +++ b/platform/ios/rust-entry/src/lib.rs
+          @@ -1,5 +1,66 @@
+           use std::ffi::{CStr, CString};
+           use std::os::raw::{c_char, c_uchar};
+          +
+          +use std::alloc::{GlobalAlloc, Layout, System};
+          +use std::backtrace::Backtrace;
+          +use std::sync::atomic::{AtomicBool, Ordering};
+          +
+          +struct FIFA13TracingAllocator;
+          +
+          +static FIFA13_ALLOC_TRACE_ACTIVE: AtomicBool = AtomicBool::new(false);
+          +
+          +fn fifa13_trace_host_alloc(kind: &str, old_size: usize, new_size: usize) {
+          +    // Avoid recursion because formatting/backtrace capture may itself allocate.
+          +    if new_size < 64 * 1024 * 1024 {
+          +        return;
+          +    }
+          +    if FIFA13_ALLOC_TRACE_ACTIVE.swap(true, Ordering::SeqCst) {
+          +        return;
+          +    }
+          +
+          +    eprintln!(
+          +        "FIFA13-HOST-ALLOC kind={} old_size={} new_size={} ({} MiB)",
+          +        kind,
+          +        old_size,
+          +        new_size,
+          +        new_size as f64 / (1024.0 * 1024.0)
+          +    );
+          +    eprintln!(
+          +        "FIFA13-HOST-ALLOC backtrace:\n{:?}",
+          +        Backtrace::force_capture()
+          +    );
+          +
+          +    FIFA13_ALLOC_TRACE_ACTIVE.store(false, Ordering::SeqCst);
+          +}
+          +
+          +unsafe impl GlobalAlloc for FIFA13TracingAllocator {
+          +    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+          +        fifa13_trace_host_alloc("alloc", 0, layout.size());
+          +        System.alloc(layout)
+          +    }
+          +
+          +    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+          +        fifa13_trace_host_alloc("alloc_zeroed", 0, layout.size());
+          +        System.alloc_zeroed(layout)
+          +    }
+          +
+          +    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+          +        System.dealloc(ptr, layout)
+          +    }
+          +
+          +    unsafe fn realloc(
+          +        &self,
+          +        ptr: *mut u8,
+          +        layout: Layout,
+          +        new_size: usize,
+          +    ) -> *mut u8 {
+          +        fifa13_trace_host_alloc("realloc", layout.size(), new_size);
+          +        System.realloc(ptr, layout, new_size)
+          +    }
+          +}
+          +
+          +#[global_allocator]
+          +static FIFA13_GLOBAL_ALLOCATOR: FIFA13TracingAllocator = FIFA13TracingAllocator;
+           
+           pub struct TouchHLEIOSGameMetadata {
+               display_name: CString,
+          @@ -15,6 +76,9 @@
+           }
+           
+           fn run_touchhle(args: Vec<String>) -> i32 {
+          +    // Force Rust backtraces inside the iOS host/core for this diagnostic build.
+          +    std::env::set_var("RUST_BACKTRACE", "full");
+          +    eprintln!("FIFA13-HOST-ALLOC diagnostic tracing enabled (threshold 64 MiB)");
+               touchHLE::clear_host_exit_request();
+           
+               // The emulator runs on the main thread and this is called from
+          --- a/src/frameworks/foundation/ns_file_manager.rs
+          +++ b/src/frameworks/foundation/ns_file_manager.rs
+          @@ -361,14 +361,12 @@
+                       if env.fs.is_dir(&src_child) {
+                           env.fs.create_dir_all(&dst_child).map_err(|_| ())?;
+                       } else {
+          -                let data = env.fs.read(&src_child)?;
+          -                env.fs.write(&dst_child, &data)?;
+          +                env.fs.copy_streamed(&src_child, &dst_child)?;
+                       }
+                   }
+                   Ok(())
+               } else {
+          -        let data = env.fs.read(src)?;
+          -        env.fs.write(dst, &data)
+          +        env.fs.copy_streamed(src, dst)
+               }
+           }
+           
+          @@ -1028,7 +1026,7 @@
+               }
+           
+               let is_dir = env.fs.is_dir(guest_path);
+          -    let file_size = if is_dir { 0 } else { env.fs.read(guest_path).map(|d| d.len()).unwrap_or(0) };
+          +    let file_size = if is_dir { 0 } else { env.fs.size(guest_path).unwrap_or(0) };
+           
+               let dict: id = msg_class![env; NSMutableDictionary dictionary];
+           
+          --- a/src/frameworks/foundation/ns_url_connection.rs
+          +++ b/src/frameworks/foundation/ns_url_connection.rs
+          @@ -33,7 +33,8 @@
+           const NS_URL_ERROR_NOT_CONNECTED_TO_INTERNET: i32 = -1009;
+           
+           fn fake_network_success_enabled() -> bool {
+          -    std::env::var_os("TOUCHHLE_FAKE_NETWORK_SUCCESS").is_some()
+          +    // FIFA 13 compatibility experiment.
+          +    true
+           }
+           
+           // ---------------------------------------------------------------------------
+          --- a/src/fs/bundle.rs
+          +++ b/src/fs/bundle.rs
+          @@ -10,10 +10,9 @@
+           use std::cell::RefCell;
+           use std::collections::HashMap;
+           use std::fmt::Debug;
+          -use std::io::{Cursor, Read};
+          +use std::io::{Read, Seek, Write};
+           use std::path::{Path, PathBuf};
+           use std::rc::Rc;
+          -use zip::result::ZipError;
+           use zip::ZipArchive;
+           
+           /// A helper struct to build an FsNode with files and directories coming in
+          @@ -210,7 +209,7 @@
+           /// Seeking in compressed files is hard, so the simple solution is to read the
+           /// whole file into memory. This is shared so having multiple copies of the same
+           /// file open won't waste memory.
+          -type DecompressedFile = Rc<[u8]>;
+          +type DecompressedFile = Rc<CachedIpaData>;
+           
+           /// Represents a file inside an IPA bundle that can be opened.
+           #[derive(Debug)]
+          @@ -222,138 +221,151 @@
+           }
+           
+           impl IpaFileRef {
+          -    pub fn open(&self) -> IpaFile {
+          -        // Some games, like THPS2, use a single resource bundle file which is
+          -        // opened each time a new game resource is being read.
+          -        // As IPA is basically an archive, this pattern requires unzipping to be
+          -        // done each time, which is extremely slow.
+          -        // The solution here is to cache unzipped data in memory, which should
+          -        // be OK as early iOS IPA files are relatively small in size.
+          -        let mut archive_cache = (*self.archive_files_cache).borrow_mut();
+          -        archive_cache.entry(self.index).or_insert_with(|| {
+          -            // Read the zip entry into an owned buffer inside its own block so
+          -            // the `archive` RefMut is released before we touch the caches.
+          -            let mut archive = (*self.archive).borrow_mut();
+          -            let decoded: Option<(Vec<u8>, ArchivedFileMetadata)> = match archive
+          -                .by_index(self.index)
+          -            {
+          -                Ok(mut file) => {
+          +    pub fn open(&self) -> std::io::Result<IpaFile> {
+          +        if let Some(cached) = self.archive_files_cache.borrow().get(&self.index) {
+          +            return Ok(IpaFile { file: Rc::clone(cached), position: 0 });
+          +        }
+          +        let decoded = {
+          +            let mut archive = self.archive.borrow_mut();
+          +            let mut entry = archive.by_index(self.index)
+          +                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+          +            let size = entry.size();
+          +            if size > 8 * 1024 * 1024 {
+          +                log!("FIFA13-IO begin disk cache: entry={} name={:?} bytes={}",
+          +                    self.index, entry.name(), size);
+          +                // Anonymous temporary file: automatically deleted when its last handle closes.
+          +                let mut disk = tempfile::tempfile()?;
+          +                let copied = super::stream_copy::copy(&mut entry, &mut disk)?;
+          +                if copied != size {
+          +                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+          +                        "IPA entry length does not match ZIP metadata"));
+          +                }
+          +                disk.flush()?;
+          +                log!("FIFA13-IO end disk cache: entry={} bytes={}", self.index, copied);
+          +                CachedIpaData::Disk { file: RefCell::new(disk), size }
+          +            } else {
+          +                // Bound small-file allocation even if an archive reports an incorrect size.
+          +                let mut bytes = Vec::new();
+          +                entry.take(size + 1).read_to_end(&mut bytes)?;
+          +                if bytes.len() as u64 != size {
+          +                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+          +                        "IPA entry length does not match ZIP metadata"));
+          +                }
+          +                CachedIpaData::Memory(bytes)
+          +            }
+          +        };
+          +        // Never cache a partial decode or turn an I/O failure into a successful empty file.
+          +        let file = Rc::new(decoded);
+          +        self.archive_files_cache.borrow_mut().insert(self.index, Rc::clone(&file));
+          +        Ok(IpaFile { file, position: 0 })
+          +    }
+          +
+          +    // ZIP headers contain both values; do not call open() or read payload data.
+          +    fn ensure_metadata(&self) {
+          +        if self.metadata_map.borrow().contains_key(&self.index) {
+          +            return;
+          +        }
+          +        let metadata = {
+          +            let mut archive = self.archive.borrow_mut();
+          +            let result = match archive.by_index_raw(self.index) {
+          +                Ok(file) => {
+                               let modified = file.last_modified();
+          -                    // This is not the cleanest way!
+          -                    // TODO: just use `time` or `chrono` crates for time conversions
+          -                    // (this also entails a lot of refactoring in [crate::libc:time])
+          -                    let tm = tm::from(
+          -                        modified.year(),
+          -                        modified.month(),
+          -                        modified.day(),
+          -                        modified.hour(),
+          -                        modified.minute(),
+          -                        modified.second(),
+          +                    let date = tm::from(
+          +                        modified.year(), modified.month(), modified.day(),
+          +                        modified.hour(), modified.minute(), modified.second(),
+                               );
+          -                    let timestamp = calendar_date_to_timestamp(tm);
+          -                    let size = file.size();
+          -                    let mut buf = Vec::new();
+          -                    if let Err(e) = file.read_to_end(&mut buf) {
+          -                        log!(
+          -                            "Warning: IpaFileRef::open(): IO error decompressing IPA entry {}: {}; returning partial buffer ({} bytes) to guest.",
+          -                            self.index,
+          -                            e,
+          -                            buf.len()
+          -                        );
+          -                    }
+          -                    Some((
+          -                        buf,
+          -                        ArchivedFileMetadata {
+          -                            last_modified: timestamp.into(),
+          -                            size,
+          -                        },
+          -                    ))
+          -                }
+          -                Err(ZipError::Io(e)) => {
+          -                    log!(
+          -                        "Warning: IpaFileRef::open(): IO error reading IPA entry {}: {}; returning empty file to guest.",
+          -                        self.index,
+          -                        e
+          -                    );
+          +                    Some(ArchivedFileMetadata {
+          +                        last_modified: calendar_date_to_timestamp(date).into(),
+          +                        size: file.size(),
+          +                    })
+          +                }
+          +                Err(error) => {
+          +                    log!("IPA metadata lookup failed for entry {}: {}", self.index, error);
+                               None
+                           }
+          -                Err(e) => {
+          -                    log!(
+          -                        "Warning: IpaFileRef::open(): could not open IPA entry {}: {}; returning empty file to guest.",
+          -                        self.index,
+          -                        e
+          -                    );
+          -                    None
+          -                }
+                       };
+          -            drop(archive);
+          -
+          -            match decoded {
+          -                Some((buf, meta)) => {
+          -                    (*self.metadata_map)
+          -                        .borrow_mut()
+          -                        .entry(self.index)
+          -                        .or_insert(meta);
+          -                    Rc::from(buf)
+          -                }
+          -                None => {
+          -                    Rc::from(Vec::new())
+          -                }
+          -            }
+          -        });
+          -        let cached_file = Rc::clone(archive_cache.get(&self.index).unwrap());
+          -        IpaFile {
+          -            file: Cursor::new(cached_file),
+          +            result
+          +        };
+          +        // Release the archive borrow before touching the metadata cache.
+          +        // Failed lookups are not cached, allowing a later lookup to retry.
+          +        if let Some(metadata) = metadata {
+          +            self.metadata_map.borrow_mut().entry(self.index).or_insert(metadata);
+                   }
+               }
+           
+               pub fn get_last_modified(&self) -> time_t {
+          -        if !self.metadata_map.borrow().contains_key(&self.index) {
+          -            // This will force metadata loading
+          -            // TODO: get metadata without reading the file
+          -            _ = self.open();
+          -        }
+          -        self.metadata_map
+          -            .borrow()
+          -            .get(&self.index)
+          -            .unwrap()
+          -            .last_modified
+          -            .try_into()
+          -            .unwrap()
+          -    }
+          +        self.ensure_metadata();
+          +        self.metadata_map.borrow().get(&self.index)
+          +            .map(|meta| meta.last_modified.try_into().unwrap_or_default())
+          +            .unwrap_or_default()
+          +    }
+          +
+               pub fn get_size(&self) -> u64 {
+          -        if !self.metadata_map.borrow().contains_key(&self.index) {
+          -            // This will force metadata loading
+          -            // TODO: get metadata without reading the file
+          -            _ = self.open();
+          -        }
+          -        self.metadata_map.borrow().get(&self.index).unwrap().size
+          -    }
+          -}
+          -
+          -/// Represents an opened file in an IPA bundle.
+          -#[derive(Clone)]
+          +        self.ensure_metadata();
+          +        self.metadata_map.borrow().get(&self.index)
+          +            .map(|meta| meta.size).unwrap_or_default()
+          +    }
+          +}
+          +
+          +/// Shared decompressed data. Large entries live on disk instead of in RAM.
+          +#[derive(Debug)]
+          +enum CachedIpaData {
+          +    Memory(Vec<u8>),
+          +    Disk { file: RefCell<std::fs::File>, size: u64 },
+          +}
+          +
+          +impl CachedIpaData {
+          +    fn len(&self) -> u64 {
+          +        match self {
+          +            Self::Memory(bytes) => bytes.len() as u64,
+          +            Self::Disk { size, .. } => *size,
+          +        }
+          +    }
+          +}
+          +
+          +/// Each guest handle has an independent position, including cloned handles.
+          +#[derive(Clone, Debug)]
+           pub struct IpaFile {
+          -    file: Cursor<DecompressedFile>,
+          -}
+          -
+          -impl Debug for IpaFile {
+          -    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+          -        f.debug_struct("IpaFile")
+          -            .field("size", &self.file.get_ref().len())
+          -            .finish()
+          -    }
+          +    file: DecompressedFile,
+          +    position: u64,
+           }
+           
+           impl Read for IpaFile {
+               fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+          -        self.file.read(buf)
+          -    }
+          -}
+          -
+          -impl std::io::Seek for IpaFile {
+          +        if self.position >= self.file.len() || buf.is_empty() {
+          +            return Ok(0);
+          +        }
+          +        let count = match &*self.file {
+          +            CachedIpaData::Memory(bytes) => {
+          +                let start = self.position as usize;
+          +                let count = buf.len().min(bytes.len() - start);
+          +                buf[..count].copy_from_slice(&bytes[start..start + count]);
+          +                count
+          +            }
+          +            CachedIpaData::Disk { file, .. } => {
+          +                let mut file = file.borrow_mut();
+          +                file.seek(std::io::SeekFrom::Start(self.position))?;
+          +                file.read(buf)?
+          +            }
+          +        };
+          +        self.position += count as u64;
+          +        Ok(count)
+          +    }
+          +}
+          +
+          +impl Seek for IpaFile {
+               fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+          -        self.file.seek(pos)
+          -    }
+          -}
+          -
+          +        use std::io::SeekFrom;
+          +        let next = match pos {
+          +            SeekFrom::Start(offset) => offset as i128,
+          +            SeekFrom::Current(offset) => self.position as i128 + offset as i128,
+          +            SeekFrom::End(offset) => self.file.len() as i128 + offset as i128,
+          +        };
+          +        if !(0..=u64::MAX as i128).contains(&next) {
+          +            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+          +                "Invalid IPA seek position"));
+          +        }
+          +        self.position = next as u64;
+          +        Ok(self.position)
+          +    }
+          +}
+          --- /dev/null
+          +++ b/src/fs/stream_copy.rs
+          @@ -0,0 +1,24 @@
+          +/*
+          + * This Source Code Form is subject to the terms of the Mozilla Public
+          + * License, v. 2.0. If a copy of the MPL was not distributed with this
+          + * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+          + */
+          +//! Copy with fixed memory use, including for very large IPA entries.
+          +use std::io::{self, Read, Write};
+          +
+          +pub(super) fn copy<R: Read, W: Write>(source: &mut R, target: &mut W) -> io::Result<u64> {
+          +    let mut buffer = [0u8; 64 * 1024];
+          +    let mut total = 0u64;
+          +    loop {
+          +        let count = match source.read(&mut buffer) {
+          +            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+          +            result => result?,
+          +        };
+          +        if count == 0 {
+          +            return Ok(total);
+          +        }
+          +        target.write_all(&buffer[..count])?;
+          +        total = total.checked_add(count as u64)
+          +            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Copy size overflow"))?;
+          +    }
+          +}
+          --- a/src/fs.rs
+          +++ b/src/fs.rs
+          @@ -26,6 +26,7 @@
+           //! See also [crate::paths], which has paths for host files used by touchHLE.
+           
+           mod bundle;
+          +mod stream_copy;
+           
+           pub use bundle::BundleData;
+           
+          @@ -440,8 +441,10 @@
+                   GuestFile::File(file)
+               }
+           
+          -    fn from_ipa_file(file: &IpaFileRef) -> GuestFile {
+          -        GuestFile::IpaBundleFile(file.open())
+          +    fn from_ipa_file(file: &IpaFileRef) -> Result<GuestFile, ()> {
+          +        file.open().map(GuestFile::IpaBundleFile).map_err(|error| {
+          +            log!("FIFA13-IO failed to open IPA entry: {}", error);
+          +        })
+               }
+           
+               fn from_resource_file(file: paths::ResourceFile) -> GuestFile {
+          @@ -1103,6 +1106,34 @@
+                   Ok(paths)
+               }
+           
+          +    /// Copy file contents without allocating a whole-file buffer.
+          +    pub fn copy_streamed(&mut self, src: &GuestPath, dst: &GuestPath) -> Result<(), ()> {
+          +        // Reject equivalent paths before opening the destination for truncation.
+          +        if src == dst || self.exists(dst) {
+          +            return Err(());
+          +        }
+          +        log!("FIFA13-IO begin copy: {:?} -> {:?}", src, dst);
+          +        let mut source = self.open(src)?;
+          +        let mut options = GuestOpenOptions::new();
+          +        options.write().create().truncate();
+          +        let mut target = self.open_with_options(dst, options)?;
+          +        let result = stream_copy::copy(&mut source, &mut target)
+          +            .and_then(|count| { target.flush()?; Ok(count) });
+          +        drop(target);
+          +        match result {
+          +            Ok(count) => {
+          +                log!("FIFA13-IO end copy: {:?} bytes={}", dst, count);
+          +                Ok(())
+          +            }
+          +            Err(error) => {
+          +                log!("FIFA13-IO copy failed: {:?} -> {:?}: {}", src, dst, error);
+          +                // Do not leave a truncated destination looking like a completed copy.
+          +                let _ = self.remove(dst);
+          +                Err(())
+          +            }
+          +        }
+          +    }
+          +
+               /// Like [std::fs::read] but for the guest filesystem.
+               pub fn read<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {
+                   let mut file = self.open(path.as_ref())?;
+          @@ -1132,7 +1163,7 @@
+                               let host_file = handle_open_err(File::open(host_path), host_path);
+                               Ok(GuestFile::from_host_file(host_file))
+                           }
+          -                FileLocation::IpaFileRef(file) => Ok(GuestFile::from_ipa_file(file)),
+          +                FileLocation::IpaFileRef(file) => GuestFile::from_ipa_file(file),
+                           FileLocation::ResourceFilePath(name) => {
+                               let resource_file = handle_open_err(paths::ResourceFile::open(name), name);
+                               Ok(GuestFile::from_resource_file(resource_file))
+          @@ -1267,7 +1298,7 @@
+                                   }
+                                   FileLocation::IpaFileRef(file) => {
+                                       assert!(!(writeable || append || write));
+          -                            return Ok(GuestFile::from_ipa_file(file));
+          +                            return GuestFile::from_ipa_file(file);
+                                   }
+                                   FileLocation::ResourceFilePath(name) => {
+                                       assert!(!(writeable || append || write));
+          --- a/src/libc/malloc.rs
+          +++ b/src/libc/malloc.rs
+          @@ -58,8 +58,8 @@
+                       reserved2: Ptr::null(),
+                       size: fn_ptr(env, "_malloc_zone_size"),
+                       malloc: fn_ptr(env, "_malloc_zone_malloc"),
+          -            calloc: Ptr::null(),
+          -            valloc: Ptr::null(),
+          +            calloc: fn_ptr(env, "_malloc_zone_calloc"),
+          +            valloc: fn_ptr(env, "_malloc_zone_valloc"),
+                       free: fn_ptr(env, "_malloc_zone_free"),
+                       realloc: fn_ptr(env, "_malloc_zone_realloc"),
+                       destroy: fn_ptr(env, "_malloc_destroy_zone"),
+          @@ -85,10 +85,15 @@
+           
+           fn malloc_create_zone(
+               env: &mut Environment,
+          -    _start_size: GuestUSize,
+          +    start_size: GuestUSize,
+               flags: u32,
+           ) -> MutPtr<malloc_zone_t> {
+               assert_eq!(flags, 0);
+          +    log!(
+          +        "FIFA13-DIAG malloc_create_zone(start_size={} bytes / {} KB)",
+          +        start_size,
+          +        start_size / 1024
+          +    );
+               // All zones are backed by the single global heap, so a created zone is
+               // just another `malloc_zone_t` struct.
+               let zone_data = malloc_zone_t::new(env);
+          @@ -118,7 +123,57 @@
+               _zone: MutPtr<malloc_zone_t>,
+               size: GuestUSize,
+           ) -> MutVoidPtr {
+          -    env.mem.alloc(size)
+          +    if size >= 16 * 1024 * 1024 {
+          +        log!("FIFA13-DIAG malloc_zone_malloc({} bytes)", size);
+          +    }
+          +    let ptr = env.mem.alloc(size);
+          +    if size >= 16 * 1024 * 1024 {
+          +        log!("FIFA13-DIAG malloc_zone_malloc -> {:#x}", ptr.to_bits());
+          +    }
+          +    ptr
+          +}
+          +
+          +fn malloc_zone_calloc(
+          +    env: &mut Environment,
+          +    _zone: MutPtr<malloc_zone_t>,
+          +    count: GuestUSize,
+          +    size: GuestUSize,
+          +) -> MutVoidPtr {
+          +    let Some(mut total) = count.checked_mul(size) else {
+          +        log!(
+          +            "FIFA13-DIAG malloc_zone_calloc overflow: count={} size={}",
+          +            count,
+          +            size
+          +        );
+          +        return MutVoidPtr::null();
+          +    };
+          +    if total == 0 {
+          +        total = 1;
+          +    }
+          +    if total >= 16 * 1024 * 1024 {
+          +        log!(
+          +            "FIFA13-DIAG malloc_zone_calloc(count={}, size={}, total={} bytes)",
+          +            count,
+          +            size,
+          +            total
+          +        );
+          +    }
+          +    let ptr = env.mem.calloc(total);
+          +    if total >= 16 * 1024 * 1024 {
+          +        log!("FIFA13-DIAG malloc_zone_calloc -> {:#x}", ptr.to_bits());
+          +    }
+          +    ptr
+          +}
+          +
+          +fn malloc_zone_valloc(
+          +    env: &mut Environment,
+          +    zone: MutPtr<malloc_zone_t>,
+          +    size: GuestUSize,
+          +) -> MutVoidPtr {
+          +    if size >= 16 * 1024 * 1024 {
+          +        log!("FIFA13-DIAG malloc_zone_valloc({} bytes)", size);
+          +    }
+          +    malloc_zone_memalign(env, zone, 4096, size)
+           }
+           
+           fn malloc_zone_realloc(
+          @@ -198,6 +253,8 @@
+               export_c_func!(malloc_destroy_zone(_)),
+               export_c_func!(malloc_zone_free(_, _)),
+               export_c_func!(malloc_zone_malloc(_, _)),
+          +    export_c_func!(malloc_zone_calloc(_, _, _)),
+          +    export_c_func!(malloc_zone_valloc(_, _)),
+               export_c_func!(malloc_zone_memalign(_, _, _)),
+               export_c_func!(malloc_zone_realloc(_, _, _)),
+               export_c_func!(malloc_zone_size(_, _)),
+          --- /dev/null
+          +++ b/tests/fifa13-io/Cargo.toml
+          @@ -0,0 +1,8 @@
+          +[package]
+          +name = "fifa13-io-regression"
+          +version = "0.1.0"
+          +edition = "2021"
+          +[workspace]
+          +[dependencies]
+          +zip = { version = "=0.6.6", default-features = false, features = ["deflate"] }
+          +tempfile = "=3.23.0"
+          --- /dev/null
+          +++ b/tests/fifa13-io/src/lib.rs
+          @@ -0,0 +1,319 @@
+          +#![allow(dead_code, non_camel_case_types, unused_imports)]
+          +use std::cell::RefCell;
+          +use std::collections::HashMap;
+          +use std::fmt::Debug;
+          +use std::io::{Read, Seek, Write};
+          +use std::rc::Rc;
+          +use zip::ZipArchive;
+          +use std::alloc::{GlobalAlloc, Layout, System};
+          +use std::sync::atomic::{AtomicUsize, Ordering};
+          +static MAX_ALLOCATION: AtomicUsize = AtomicUsize::new(0);
+          +struct TrackingAllocator;
+          +unsafe impl GlobalAlloc for TrackingAllocator {
+          +    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+          +        MAX_ALLOCATION.fetch_max(layout.size(), Ordering::SeqCst);
+          +        System.alloc(layout)
+          +    }
+          +    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) { System.dealloc(ptr, layout) }
+          +    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+          +        MAX_ALLOCATION.fetch_max(size, Ordering::SeqCst);
+          +        System.realloc(ptr, layout, size)
+          +    }
+          +}
+          +#[global_allocator]
+          +static ALLOCATOR: TrackingAllocator = TrackingAllocator;
+          +macro_rules! log { ($($arg:tt)*) => { eprintln!($($arg)*); }; }
+          +// Only the unrelated guest calendar conversion is stubbed in this I/O harness.
+          +type time_t = i32;
+          +struct tm;
+          +impl tm { fn from(_: u16, _: u8, _: u8, _: u8, _: u8, _: u8) -> Self { Self } }
+          +fn calendar_date_to_timestamp(_: tm) -> i64 { 0 }
+          +mod stream_copy;
+          +mod ipa {
+          +use super::*;
+          +#[derive(Debug)]
+          +struct ArchivedFileMetadata {
+          +    /// Unix timestamp of file modification
+          +    last_modified: i64,
+          +    /// Uncompressed file size
+          +    size: u64,
+          +}
+          +
+          +/// Shared (refcounted) copy of the decompressed version of a file in an IPA.
+          +///
+          +/// Seeking in compressed files is hard, so the simple solution is to read the
+          +/// whole file into memory. This is shared so having multiple copies of the same
+          +/// file open won't waste memory.
+          +type DecompressedFile = Rc<CachedIpaData>;
+          +
+          +/// Represents a file inside an IPA bundle that can be opened.
+          +#[derive(Debug)]
+          +pub struct IpaFileRef {
+          +    archive: Rc<RefCell<ZipArchive<std::fs::File>>>,
+          +    archive_files_cache: Rc<RefCell<HashMap<usize, DecompressedFile>>>,
+          +    metadata_map: Rc<RefCell<HashMap<usize, ArchivedFileMetadata>>>,
+          +    index: usize,
+          +}
+          +
+          +impl IpaFileRef {
+          +    pub fn open(&self) -> std::io::Result<IpaFile> {
+          +        if let Some(cached) = self.archive_files_cache.borrow().get(&self.index) {
+          +            return Ok(IpaFile { file: Rc::clone(cached), position: 0 });
+          +        }
+          +        let decoded = {
+          +            let mut archive = self.archive.borrow_mut();
+          +            let mut entry = archive.by_index(self.index)
+          +                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+          +            let size = entry.size();
+          +            if size > 8 * 1024 * 1024 {
+          +                log!("FIFA13-IO begin disk cache: entry={} name={:?} bytes={}",
+          +                    self.index, entry.name(), size);
+          +                // Anonymous temporary file: automatically deleted when its last handle closes.
+          +                let mut disk = tempfile::tempfile()?;
+          +                let copied = super::stream_copy::copy(&mut entry, &mut disk)?;
+          +                if copied != size {
+          +                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+          +                        "IPA entry length does not match ZIP metadata"));
+          +                }
+          +                disk.flush()?;
+          +                log!("FIFA13-IO end disk cache: entry={} bytes={}", self.index, copied);
+          +                CachedIpaData::Disk { file: RefCell::new(disk), size }
+          +            } else {
+          +                // Bound small-file allocation even if an archive reports an incorrect size.
+          +                let mut bytes = Vec::new();
+          +                entry.take(size + 1).read_to_end(&mut bytes)?;
+          +                if bytes.len() as u64 != size {
+          +                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+          +                        "IPA entry length does not match ZIP metadata"));
+          +                }
+          +                CachedIpaData::Memory(bytes)
+          +            }
+          +        };
+          +        // Never cache a partial decode or turn an I/O failure into a successful empty file.
+          +        let file = Rc::new(decoded);
+          +        self.archive_files_cache.borrow_mut().insert(self.index, Rc::clone(&file));
+          +        Ok(IpaFile { file, position: 0 })
+          +    }
+          +
+          +    // ZIP headers contain both values; do not call open() or read payload data.
+          +    fn ensure_metadata(&self) {
+          +        if self.metadata_map.borrow().contains_key(&self.index) {
+          +            return;
+          +        }
+          +        let metadata = {
+          +            let mut archive = self.archive.borrow_mut();
+          +            let result = match archive.by_index_raw(self.index) {
+          +                Ok(file) => {
+          +                    let modified = file.last_modified();
+          +                    let date = tm::from(
+          +                        modified.year(), modified.month(), modified.day(),
+          +                        modified.hour(), modified.minute(), modified.second(),
+          +                    );
+          +                    Some(ArchivedFileMetadata {
+          +                        last_modified: calendar_date_to_timestamp(date).into(),
+          +                        size: file.size(),
+          +                    })
+          +                }
+          +                Err(error) => {
+          +                    log!("IPA metadata lookup failed for entry {}: {}", self.index, error);
+          +                    None
+          +                }
+          +            };
+          +            result
+          +        };
+          +        // Release the archive borrow before touching the metadata cache.
+          +        // Failed lookups are not cached, allowing a later lookup to retry.
+          +        if let Some(metadata) = metadata {
+          +            self.metadata_map.borrow_mut().entry(self.index).or_insert(metadata);
+          +        }
+          +    }
+          +
+          +    pub fn get_last_modified(&self) -> time_t {
+          +        self.ensure_metadata();
+          +        self.metadata_map.borrow().get(&self.index)
+          +            .map(|meta| meta.last_modified.try_into().unwrap_or_default())
+          +            .unwrap_or_default()
+          +    }
+          +
+          +    pub fn get_size(&self) -> u64 {
+          +        self.ensure_metadata();
+          +        self.metadata_map.borrow().get(&self.index)
+          +            .map(|meta| meta.size).unwrap_or_default()
+          +    }
+          +}
+          +
+          +/// Shared decompressed data. Large entries live on disk instead of in RAM.
+          +#[derive(Debug)]
+          +enum CachedIpaData {
+          +    Memory(Vec<u8>),
+          +    Disk { file: RefCell<std::fs::File>, size: u64 },
+          +}
+          +
+          +impl CachedIpaData {
+          +    fn len(&self) -> u64 {
+          +        match self {
+          +            Self::Memory(bytes) => bytes.len() as u64,
+          +            Self::Disk { size, .. } => *size,
+          +        }
+          +    }
+          +}
+          +
+          +/// Each guest handle has an independent position, including cloned handles.
+          +#[derive(Clone, Debug)]
+          +pub struct IpaFile {
+          +    file: DecompressedFile,
+          +    position: u64,
+          +}
+          +
+          +impl Read for IpaFile {
+          +    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+          +        if self.position >= self.file.len() || buf.is_empty() {
+          +            return Ok(0);
+          +        }
+          +        let count = match &*self.file {
+          +            CachedIpaData::Memory(bytes) => {
+          +                let start = self.position as usize;
+          +                let count = buf.len().min(bytes.len() - start);
+          +                buf[..count].copy_from_slice(&bytes[start..start + count]);
+          +                count
+          +            }
+          +            CachedIpaData::Disk { file, .. } => {
+          +                let mut file = file.borrow_mut();
+          +                file.seek(std::io::SeekFrom::Start(self.position))?;
+          +                file.read(buf)?
+          +            }
+          +        };
+          +        self.position += count as u64;
+          +        Ok(count)
+          +    }
+          +}
+          +
+          +impl Seek for IpaFile {
+          +    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+          +        use std::io::SeekFrom;
+          +        let next = match pos {
+          +            SeekFrom::Start(offset) => offset as i128,
+          +            SeekFrom::Current(offset) => self.position as i128 + offset as i128,
+          +            SeekFrom::End(offset) => self.file.len() as i128 + offset as i128,
+          +        };
+          +        if !(0..=u64::MAX as i128).contains(&next) {
+          +            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+          +                "Invalid IPA seek position"));
+          +        }
+          +        self.position = next as u64;
+          +        Ok(self.position)
+          +    }
+          +}
+          +#[cfg(test)]
+          +mod tests {
+          +    use super::*;
+          +    use std::io::{SeekFrom, Write};
+          +    use zip::write::FileOptions;
+          +
+          +    fn fixture(size: usize) -> IpaFileRef {
+          +        let mut disk = tempfile::tempfile().unwrap();
+          +        {
+          +            let mut zip = zip::ZipWriter::new(&mut disk);
+          +            zip.start_file("Payload/Test.app/data", FileOptions::default()
+          +                .compression_method(zip::CompressionMethod::Deflated)).unwrap();
+          +            let block: Vec<u8> = (0..65536).map(|i| (i % 251) as u8).collect();
+          +            let mut remaining = size;
+          +            while remaining > 0 {
+          +                let count = remaining.min(block.len());
+          +                zip.write_all(&block[..count]).unwrap();
+          +                remaining -= count;
+          +            }
+          +            zip.finish().unwrap();
+          +        }
+          +        disk.rewind().unwrap();
+          +        IpaFileRef {
+          +            archive: Rc::new(RefCell::new(ZipArchive::new(disk).unwrap())),
+          +            archive_files_cache: Rc::new(RefCell::new(HashMap::new())),
+          +            metadata_map: Rc::new(RefCell::new(HashMap::new())), index: 0,
+          +        }
+          +    }
+          +
+          +    #[test]
+          +    fn large_entry_metadata_does_not_decode() {
+          +        let entry = fixture(16 * 1024 * 1024 + 17);
+          +        assert_eq!(entry.get_size(), 16 * 1024 * 1024 + 17);
+          +        let _ = entry.get_last_modified();
+          +        assert!(entry.archive_files_cache.borrow().is_empty());
+          +    }
+          +
+          +    #[test]
+          +    fn large_entry_uses_disk_and_independent_cursors() {
+          +        let size = 16 * 1024 * 1024 + 17;
+          +        let entry = fixture(size);
+          +        MAX_ALLOCATION.store(0, std::sync::atomic::Ordering::SeqCst);
+          +        let mut first = entry.open().unwrap();
+          +        let largest = MAX_ALLOCATION.load(std::sync::atomic::Ordering::SeqCst);
+          +        assert!(largest < 1024 * 1024, "large allocation while decoding: {largest}");
+          +        assert!(matches!(&*first.file, CachedIpaData::Disk { .. }));
+          +        let mut second = entry.open().unwrap();
+          +        assert!(Rc::ptr_eq(&first.file, &second.file));
+          +        first.seek(SeekFrom::Start(3)).unwrap();
+          +        let mut cloned = first.clone();
+          +        let mut bytes = [0u8; 3];
+          +        first.read_exact(&mut bytes).unwrap();
+          +        assert_eq!(bytes, [3, 4, 5]);
+          +        second.read_exact(&mut bytes).unwrap();
+          +        assert_eq!(bytes, [0, 1, 2]);
+          +        cloned.read_exact(&mut bytes).unwrap();
+          +        assert_eq!(bytes, [3, 4, 5]);
+          +        assert!(first.seek(SeekFrom::Start(0)).is_ok());
+          +        assert!(first.seek(SeekFrom::Current(-1)).is_err());
+          +        assert_eq!(first.seek(SeekFrom::End(5)).unwrap(), size as u64 + 5);
+          +        assert_eq!(first.read(&mut bytes).unwrap(), 0);
+          +        first.seek(SeekFrom::End(-3)).unwrap();
+          +        first.read_exact(&mut bytes).unwrap();
+          +        assert_eq!(bytes, [14, 15, 16]);
+          +        first.rewind().unwrap();
+          +        let mut dest = tempfile::tempfile().unwrap();
+          +        assert_eq!(stream_copy::copy(&mut first, &mut dest).unwrap(), size as u64);
+          +        assert_eq!(dest.metadata().unwrap().len(), size as u64);
+          +    }
+          +
+          +    #[test]
+          +    fn small_and_empty_entries_preserve_eof() {
+          +        for size in [0, 19] {
+          +            let entry = fixture(size);
+          +            let mut file = entry.open().unwrap();
+          +            assert!(matches!(&*file.file, CachedIpaData::Memory(_)));
+          +            let mut bytes = Vec::new();
+          +            file.read_to_end(&mut bytes).unwrap();
+          +            assert_eq!(bytes.len(), size);
+          +        }
+          +    }
+          +
+          +    #[test]
+          +    fn failed_entry_does_not_enter_cache() {
+          +        let mut entry = fixture(19);
+          +        entry.index = 999;
+          +        assert!(entry.open().is_err());
+          +        assert!(entry.archive_files_cache.borrow().is_empty());
+          +    }
+          +
+          +    #[test]
+          +    fn copy_retries_interruption_and_propagates_write_failure() {
+          +        struct InterruptedOnce(bool);
+          +        impl Read for InterruptedOnce {
+          +            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+          +                if !self.0 { self.0 = true; return Err(std::io::ErrorKind::Interrupted.into()); }
+          +                bytes[0] = 7;
+          +                Ok(1)
+          +            }
+          +        }
+          +        struct FailingWriter;
+          +        impl Write for FailingWriter {
+          +            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+          +                Err(std::io::ErrorKind::PermissionDenied.into())
+          +            }
+          +            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+          +        }
+          +        assert_eq!(stream_copy::copy(&mut InterruptedOnce(false), &mut FailingWriter)
+          +            .unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+          +    }
+          +}
+          +
+          +}
+          --- /dev/null
+          +++ b/tests/fifa13-io/src/stream_copy.rs
+          @@ -0,0 +1,24 @@
+          +/*
+          + * This Source Code Form is subject to the terms of the Mozilla Public
+          + * License, v. 2.0. If a copy of the MPL was not distributed with this
+          + * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+          + */
+          +//! Copy with fixed memory use, including for very large IPA entries.
+          +use std::io::{self, Read, Write};
+          +
+          +pub(super) fn copy<R: Read, W: Write>(source: &mut R, target: &mut W) -> io::Result<u64> {
+          +    let mut buffer = [0u8; 64 * 1024];
+          +    let mut total = 0u64;
+          +    loop {
+          +        let count = match source.read(&mut buffer) {
+          +            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+          +            result => result?,
+          +        };
+          +        if count == 0 {
+          +            return Ok(total);
+          +        }
+          +        target.write_all(&buffer[..count])?;
+          +        total = total.checked_add(count as u64)
+          +            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Copy size overflow"))?;
+          +    }
+          +}
+          FIFA13_PATCH
+          git apply --check "$RUNNER_TEMP/fifa13-v4.patch"
+          git apply "$RUNNER_TEMP/fifa13-v4.patch"
+
+      - name: Test bounded memory, seek, cache and copy errors
+        run: cargo test --manifest-path tests/fifa13-io/Cargo.toml -- --test-threads=1
+
+      - name: Validate patched Rust syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in src/fs.rs src/fs/bundle.rs src/fs/stream_copy.rs src/libc/malloc.rs src/frameworks/foundation/ns_file_manager.rs src/frameworks/foundation/ns_url_connection.rs platform/ios/rust-entry/src/lib.rs; do
+            rustfmt --edition 2021 --emit stdout "$file" > /dev/null
+          done
+
+      - name: Build shared SDL2 for iPhone
+        run: |
+          sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+
+      - name: Build unsigned iOS app
+        run: |
+          export CARGO_PROFILE_RELEASE_DEBUG=2
+          sh platform/ios/scripts/build-host.sh iphoneos Release
+
+      - name: Give test build a separate identity
+        run: |
+          APP="build/host-iphoneos/Build/Products/Release-iphoneos/Applesauce.app"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleIdentifier com.hasangs27.applesauce.fifa13ipafixv4" \
+            "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleDisplayName Applesauce FIFA13 IPAFIX4" \
+            "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleName Applesauce FIFA13 IPAFIX4" \
+            "$APP/Info.plist" || true
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p dist
+          sh platform/ios/scripts/package-ipa.sh \
+            dist/Applesauce-FIFA13-IPAMetadataFixV4-unsigned.ipa
+
+      - name: Verify IPA and checksum
+        run: |
+          test -s dist/Applesauce-FIFA13-IPAMetadataFixV4-unsigned.ipa
+          unzip -tq dist/Applesauce-FIFA13-IPAMetadataFixV4-unsigned.ipa
+          cd dist
+          shasum -a 256 -c Applesauce-FIFA13-IPAMetadataFixV4-unsigned.ipa.sha256
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Applesauce-FIFA13-IPAMetadataFixV4
+          path: |
+            dist/Applesauce-FIFA13-IPAMetadataFixV4-unsigned.ipa
+            dist/Applesauce-FIFA13-IPAMetadataFixV4-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 7
+
