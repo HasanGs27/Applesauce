@@ -1,0 +1,91 @@
+name: Build FIFA13 Fake-Network Applesauce
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Rust iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install build dependencies
+        run: |
+          brew install cmake ninja boost
+          echo "TOUCHHLE_BOOST_ROOT=$(brew --prefix boost)/include" >> "$GITHUB_ENV"
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+
+      - name: Force fake HTTP 200 for FIFA 13 test
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/frameworks/foundation/ns_url_connection.rs")
+          s = p.read_text(encoding="utf-8")
+
+          old = '''fn fake_network_success_enabled() -> bool {
+              std::env::var_os("TOUCHHLE_FAKE_NETWORK_SUCCESS").is_some()
+          }'''
+
+          new = '''fn fake_network_success_enabled() -> bool {
+              // FIFA 13 compatibility experiment:
+              // force HyperHLE's built-in fake HTTP 200 path.
+              true
+          }'''
+
+          if old not in s:
+              raise SystemExit("Patch target not found: upstream source changed.")
+
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          print("Fake-network patch applied.")
+          PY
+
+      - name: Build unsigned iOS app
+        run: |
+          sh platform/ios/scripts/build-host.sh iphoneos Release
+
+      - name: Give test build a separate identity
+        run: |
+          APP="build/host-iphoneos/Build/Products/Release-iphoneos/Applesauce.app"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleIdentifier com.hasangs27.applesauce.fifa13test" \
+            "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleDisplayName Applesauce FIFA13" \
+            "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleName Applesauce FIFA13" \
+            "$APP/Info.plist" || true
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p dist
+          sh platform/ios/scripts/package-ipa.sh \
+            dist/Applesauce-FIFA13-FakeNetwork-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Applesauce-FIFA13-FakeNetwork
+          path: |
+            dist/Applesauce-FIFA13-FakeNetwork-unsigned.ipa
+            dist/Applesauce-FIFA13-FakeNetwork-unsigned.ipa.sha256
+          retention-days: 7
